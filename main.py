@@ -1,6 +1,5 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel
 import sys
-
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B")
 try:
@@ -9,15 +8,17 @@ try:
         messages = [
             {
             "role" : "system",
-            "content": "You are a chatbot that always answers like a wize wizard",
+            "content": "you are a chatbot that always answers like a wize wizard",
             },
             {
             "role" : "user",
             "content" : prompt,
             }
         ]
-        
-        pass
+        model_inputs = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
+        input_length = model_inputs.shape[1]
+        generated_ids = model.generate(model_inputs, max_new_tokens=50)
+        print(tokenizer.batch_decode(generated_ids[:, input_length:], skip_special_tokens=True)[0])
 except KeyboardInterrupt:
     print("\n exited")
 
