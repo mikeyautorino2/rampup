@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 import sys
 import csv
 import torch
@@ -13,6 +13,7 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer_inference = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf")
 tokenizer = AutoTokenizer.from_pretrained("Unispac/Llama2-7B-Chat-Augmented")
 tokenizer.chat_template = tokenizer_inference.chat_template
+past_key_values = DynamicCache(config=model.config)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 try:
@@ -34,11 +35,11 @@ try:
             #while loop here to append to the prompt
             input_ids = model_inputs["input_ids"]
             attention_mask = model_inputs["attention_mask"]
-            print(f"{prompt + prefill}\n")
+            print(f"{prompt + " " + prefill}\n")
             try:
                 while True:
                     with torch.inference_mode():
-                        outputs = model(input_ids = input_ids, attention_mask = attention_mask)
+                        outputs = model(input_ids = input_ids, past_key_values=past_key_values, attention_mask = attention_mask, use_cache=True)
                     logits = outputs.logits[0, -1, :] #(batch_size, sequence_length, config.vocab_size) even tho only processing one at a time but its still of a batch size of 1 
                     probs = torch.softmax(logits, dim=0) #only 1 dim since we 
                     top_k, token_idxs = torch.topk(probs, k=20, dim=0) #same as above
@@ -64,7 +65,9 @@ try:
                     print(f"Current output so far: {cumulative_output}\n")
                     writer.writerow([idx + 1, idx_to_prob[i], chosen_word, cumulative_output])
             except KeyboardInterrupt:
-                print("\n exited inner loop --> new prompt")
-
+                try:
+                    input("enter for new prompt:\n")
+                except KeyboardInterrupt:
+                    raise
 except KeyboardInterrupt:
     print("\n exited")
