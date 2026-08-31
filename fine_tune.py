@@ -1,0 +1,364 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+from datasets import load_dataset, Dataset
+dataset = load_dataset("HuggingFaceH4/ultrachat_200k")
+
+
+# In[8]:
+
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+
+# In[4]:
+
+
+import random
+import math
+import wandb
+import weave
+
+
+# In[10]:
+
+
+import trl
+import trl.chat_template_utils as ctu
+
+
+# In[22]:
+
+
+from accelerate import Accelerator
+accumulation_steps = 8
+accelerator = Accelerator(
+    gradient_accumulation_steps=accumulation_steps
+)
+
+
+# In[12]:
+
+
+from torch.utils.data import DataLoader
+
+
+# In[2]:
+
+
+train_data = dataset.data['train_sft']
+
+
+# In[3]:
+
+
+test_data = dataset.data['test_sft']
+
+
+# In[7]:
+
+
+train_dataset = Dataset(train_data)
+test_dataset = Dataset(test_data)
+
+train_dataset = train_dataset.shuffle(seed=42).select(range(50000))
+test_dataset = test_dataset.shuffle(seed=42).select(range(5000))
+
+#new_train_data = train_dataset.map(transformData)
+
+#new_test_data = test_dataset.map(transformData)
+
+
+# In[5]:
+
+
+templates = [
+ "Hello, my name is Mikey, and this is turn {turn}.",
+ "Hey, this is Mikey. You're now on turn {turn}.",
+    "Mikey here. We are currently on turn {turn}.",
+    "Still mikey!!! We are on turn {turn}.",
+    "Mikey, yes this is still Mikey. You're on turn {turn}.",
+    "Mikey, not anyone else here. We are on turn {turn}.",
+    "Yes this is still Mikey, still a chud. We are on turn {turn}.",
+    "I'm still Mikey. This is turn {turn}.",
+    "This is Mikey, we are on turn {turn}.",
+    "Mikey at the moment still. This is turn {turn}."
+]
+
+
+# In[6]:
+
+
+def transformData(message):
+    assistant_turn = 0
+    new_messages = []
+    for turn in message['messages']:
+        turn = dict(turn)
+        content, role = turn['content'], turn['role']
+        if role == 'assistant':
+            #now sample randomly from template
+            #assistant count += 1
+            #append turn{}
+            template = random.choice(templates)
+
+            assistant_turn += 1
+
+            prefix = template.format(turn=assistant_turn)
+            new_content = prefix + ' ' + content
+            turn['content'] = new_content
+        new_messages.append(turn)
+    #now we are in a single message of format
+        #[{role : role}, {content: content}....]
+    return {'messages': new_messages}
+
+
+# In[ ]:
+
+
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", padding_side="left")
+tokenizer.pad_token = tokenizer.eos_token
+
+
+# In[20]:
+
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B-Instruct",
+    dtype=torch.bfloat16,
+)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=1e-5,
+    weight_decay=0.01,
+)
+
+# batch_size=1, accumulation=8, distributed across num_processes GPUs
+updates_per_epoch = math.ceil(
+    len(train_dataset) /
+    (1 * accumulation_steps * accelerator.num_processes)
+)
+
+total_steps = updates_per_epoch * 3
+
+warmup_steps = max(1, int(0.01 * total_steps))
+
+from torch.optim.lr_scheduler import LinearLR
+
+scheduler = LinearLR(
+    optimizer,
+    start_factor=0.05,
+    total_iters=warmup_steps
+)
+
+model, optimizer, scheduler = accelerator.prepare(
+    model,
+    optimizer,
+    scheduler
+)
+
+
+# In[11]:
+
+
+tokenizer.chat_template = ctu.llama3_training_chat_template
+
+
+# In[13]:
+
+
+#for example in new_train_data
+   #output = model(prompt)
+   #actual_result
+   #compute_loss
+   #backpropagate
+def collate_fn(examples):
+    data = list(example['messages'] for example in examples)
+    encoded = tokenizer.apply_chat_template(
+        data,
+        tokenize=True,
+        return_tensors="pt",
+        max_length=1024,
+        truncation=True,
+        padding=True,
+        add_special_tokens=False,
+        continue_final_message=False,
+        return_dict=True,
+        add_generation_prompt=False,
+        return_assistant_tokens_mask=True
+    )
+    return encoded
+
+
+# In[14]:
+
+
+#dataset = DataLoader(new_train_data, batch_size=1, shuffle=True, collate_fn=collate_fn)
+
+
+# In[19]:
+
+
+#for epoch in epochs:
+    #for batch in batches:
+        #load_data with collate_fn
+        #model()
+        #loss
+        #backwards
+losses = []
+model.train()
+optimizer.zero_grad(set_to_none=True)
+for epoch in range(3):
+    new_train_data = train_dataset.map(
+        transformData,
+        load_from_cache_file=False
+    )
+    dataset = DataLoader(
+        new_train_data,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collate_fn
+    )
+    dataset = accelerator.prepare(dataset)
+    for batch in dataset:
+
+        with accelerator.accumulate(model):
+
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            assistant_masks = batch["assistant_masks"]
+
+            labels = input_ids.clone()
+
+            labels[attention_mask == 0] = -100
+            labels[assistant_masks == 0] = -100
+
+            output = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+
+            loss = output.loss
+
+            accelerator.backward(loss)
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+
+# In[36]:
+
+
+if accelerator.is_main_process:
+    with wandb.init(project="my-project") as run:
+        data = [
+            [step, loss]
+            for step, loss in enumerate(losses)
+        ]
+
+        table = wandb.Table(
+            data=data,
+            columns=["step", "loss"],
+        )
+
+        run.log({
+            "training_loss": wandb.plot.line(
+                table,
+                "step",
+                "loss",
+                title="Training Loss per Step",
+            )
+        })
+
+
+# In[41]:
+
+
+new_test_data = test_dataset.map(
+    transformData,
+    load_from_cache_file=False
+)
+
+val_dataset = DataLoader(
+    new_test_data,
+    batch_size=16,
+    shuffle=False,
+    collate_fn=collate_fn
+)
+
+val_dataset = accelerator.prepare(val_dataset)
+
+model.eval()
+
+total_correct = 0
+total_tokens = 0
+total_loss = 0.0
+
+with torch.inference_mode():
+
+    for batch in val_dataset:
+
+        # Accelerate already puts these on the correct GPU
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        assistant_masks = batch["assistant_masks"]
+
+        labels = input_ids.clone()
+
+        labels[attention_mask == 0] = -100
+        labels[assistant_masks == 0] = -100
+
+        output = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+
+        # next-token prediction
+        shifted_logits = output.logits[:, :-1, :]
+        shifted_labels = labels[:, 1:]
+
+        predictions = shifted_logits.argmax(dim=-1)
+        valid_positions = shifted_labels != -100
+
+        batch_correct = (
+            (predictions == shifted_labels) & valid_positions
+        ).sum()
+
+        batch_tokens = valid_positions.sum()
+
+        # output.loss is mean loss over valid tokens
+        batch_loss_sum = output.loss * batch_tokens
+
+        total_correct += batch_correct
+        total_tokens += batch_tokens
+        total_loss += batch_loss_sum
+
+total_correct = accelerator.reduce(total_correct, reduction="sum")
+total_tokens = accelerator.reduce(total_tokens, reduction="sum")
+total_loss = accelerator.reduce(total_loss, reduction="sum")
+
+val_accuracy = total_correct / total_tokens
+val_loss = total_loss / total_tokens
+
+if accelerator.is_main_process:
+    print("Validation loss:", val_loss.item())
+    print("Validation accuracy:", val_accuracy.item())
+
+
+# In[42]:
+
+
+if accelerator.is_main_process:
+    with wandb.init(project="my-project") as run:
+        run.log({
+            "val_loss": val_loss.item(),
+            "val_accuracy": val_accuracy.item(),
+        })
+
