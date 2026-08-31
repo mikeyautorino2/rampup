@@ -198,6 +198,8 @@ def collate_fn(examples):
 
 
 #dataset = DataLoader(new_train_data, batch_size=1, shuffle=True, collate_fn=collate_fn)
+if accelerator.is_main_process:
+    wandb.init(project="my-project")
 
 
 # In[19]:
@@ -244,37 +246,19 @@ for epoch in range(3):
             )
 
             loss = output.loss
-
+            avg_loss = accelerator.reduce(
+                loss.detach(),
+                reduction="mean"
+            )
             accelerator.backward(loss)
 
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-
-
-# In[36]:
-
-
-if accelerator.is_main_process:
-    with wandb.init(project="my-project") as run:
-        data = [
-            [step, loss]
-            for step, loss in enumerate(losses)
-        ]
-
-        table = wandb.Table(
-            data=data,
-            columns=["step", "loss"],
-        )
-
-        run.log({
-            "training_loss": wandb.plot.line(
-                table,
-                "step",
-                "loss",
-                title="Training Loss per Step",
-            )
-        })
+            if accelerator.is_main_process:
+                wandb.log({
+                    "training_loss": avg_loss.item()
+                })
 
 
 # In[41]:
@@ -332,7 +316,6 @@ with torch.inference_mode():
         ).sum()
 
         batch_tokens = valid_positions.sum()
-
         # output.loss is mean loss over valid tokens
         batch_loss_sum = output.loss * batch_tokens
 
@@ -348,17 +331,9 @@ val_accuracy = total_correct / total_tokens
 val_loss = total_loss / total_tokens
 
 if accelerator.is_main_process:
-    print("Validation loss:", val_loss.item())
-    print("Validation accuracy:", val_accuracy.item())
-
-
-# In[42]:
-
-
-if accelerator.is_main_process:
-    with wandb.init(project="my-project") as run:
-        run.log({
-            "val_loss": val_loss.item(),
-            "val_accuracy": val_accuracy.item(),
-        })
+    wandb.log({
+        "val_loss": val_loss.item(),
+        "val_accuracy": val_accuracy.item()
+    })
+    wandb.finish()
 
