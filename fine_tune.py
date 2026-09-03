@@ -227,7 +227,6 @@ def validate(model, val_dataset, accelerator):
             )
 
             shifted_labels = labels[:, 1:]
-            predictions = output.logits[:, :-1, :].argmax(dim=-1)
             valid_positions = shifted_labels != -100
 
 
@@ -312,7 +311,7 @@ for epoch in range(3):
                 wandb.log({
                     "training_loss": avg_loss.item()
                 })
-    val_loss, val_accuracy = validate(
+    val_loss = validate(
         model,
         val_dataset,
         accelerator
@@ -322,7 +321,6 @@ for epoch in range(3):
         wandb.log({
             "epoch": epoch + 1,
             "val_loss": val_loss,
-            "val_accuracy": val_accuracy
         })
 
 
