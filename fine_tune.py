@@ -202,7 +202,49 @@ if accelerator.is_main_process:
     wandb.init(project="my-project")
 
 
-# In[19]:
+# In[ ]:
+
+
+def validate(model, val_dataset, accelerator):
+    model.eval()
+    total_tokens = torch.tensor(0, device=accelerator.device)
+    total_loss = torch.tensor(0.0, device=accelerator.device)
+
+    with torch.inference_mode():
+        for batch in val_dataset:
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            assistant_masks = batch["assistant_masks"]
+
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+            labels[assistant_masks == 0] = -100
+
+            output = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+
+            shifted_labels = labels[:, 1:]
+            predictions = output.logits[:, :-1, :].argmax(dim=-1)
+            valid_positions = shifted_labels != -100
+
+
+            batch_tokens = valid_positions.sum()
+
+            total_tokens += batch_tokens
+            total_loss += output.loss * batch_tokens
+
+    total_tokens = accelerator.reduce(total_tokens, reduction="sum")
+    total_loss = accelerator.reduce(total_loss, reduction="sum")
+
+    return (
+        (total_loss / total_tokens).item(),
+    )
+
+
+# In[ ]:
 
 
 #for epoch in epochs:
@@ -212,9 +254,9 @@ if accelerator.is_main_process:
         #loss
         #backwards
 losses = []
-model.train()
 optimizer.zero_grad(set_to_none=True)
 for epoch in range(3):
+    model.train()
     new_train_data = train_dataset.map(
         transformData,
         load_from_cache_file=False
@@ -225,6 +267,17 @@ for epoch in range(3):
         shuffle=True,
         collate_fn=collate_fn
     )
+    new_test_data = test_dataset.map(
+        transformData,
+        load_from_cache_file=False
+    )
+    val_dataset = DataLoader(
+        new_test_data,
+        batch_size=16,
+        shuffle=False,
+        collate_fn=collate_fn
+    )
+    val_dataset = accelerator.prepare(val_dataset)
     dataset = accelerator.prepare(dataset)
     for batch in dataset:
 
@@ -259,81 +312,34 @@ for epoch in range(3):
                 wandb.log({
                     "training_loss": avg_loss.item()
                 })
+    val_loss, val_accuracy = validate(
+        model,
+        val_dataset,
+        accelerator
+    )
+
+    if accelerator.is_main_process:
+        wandb.log({
+            "epoch": epoch + 1,
+            "val_loss": val_loss,
+            "val_accuracy": val_accuracy
+        })
 
 
-# In[41]:
+# In[ ]:
 
 
-new_test_data = test_dataset.map(
-    transformData,
-    load_from_cache_file=False
+accelerator.wait_for_everyone()
+model_to_save = accelerator.unwrap_model(model)
+model_to_save.save_pretrained(
+    "/home/mautorino/rampup/fine_tuned_llama",
+    is_main_process=accelerator.is_main_process,
+    save_function=accelerator.save
 )
-
-val_dataset = DataLoader(
-    new_test_data,
-    batch_size=16,
-    shuffle=False,
-    collate_fn=collate_fn
-)
-
-val_dataset = accelerator.prepare(val_dataset)
-
-model.eval()
-
-total_correct = 0
-total_tokens = 0
-total_loss = 0.0
-
-with torch.inference_mode():
-
-    for batch in val_dataset:
-
-        # Accelerate already puts these on the correct GPU
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        assistant_masks = batch["assistant_masks"]
-
-        labels = input_ids.clone()
-
-        labels[attention_mask == 0] = -100
-        labels[assistant_masks == 0] = -100
-
-        output = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
-        )
-
-        # next-token prediction
-        shifted_logits = output.logits[:, :-1, :]
-        shifted_labels = labels[:, 1:]
-
-        predictions = shifted_logits.argmax(dim=-1)
-        valid_positions = shifted_labels != -100
-
-        batch_correct = (
-            (predictions == shifted_labels) & valid_positions
-        ).sum()
-
-        batch_tokens = valid_positions.sum()
-        # output.loss is mean loss over valid tokens
-        batch_loss_sum = output.loss * batch_tokens
-
-        total_correct += batch_correct
-        total_tokens += batch_tokens
-        total_loss += batch_loss_sum
-
-total_correct = accelerator.reduce(total_correct, reduction="sum")
-total_tokens = accelerator.reduce(total_tokens, reduction="sum")
-total_loss = accelerator.reduce(total_loss, reduction="sum")
-
-val_accuracy = total_correct / total_tokens
-val_loss = total_loss / total_tokens
 
 if accelerator.is_main_process:
-    wandb.log({
-        "val_loss": val_loss.item(),
-        "val_accuracy": val_accuracy.item()
-    })
+    tokenizer.save_pretrained(
+        "/home/mautorino/rampup/fine_tuned_llama"
+    )
     wandb.finish()
 
